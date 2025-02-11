@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 import sys
+import platform
 import argparse
 import gradio as gr
 import numpy as np
@@ -212,18 +213,22 @@ def process_audio(speech_generator, stream):
         speech_generator: 音频生成器
         stream: 是否流式处理
     
-    Yields:
-        tuple: 音频数据
+    Returns:
+        tuple: (音频数据列表, 总时长)
     """
     tts_speeches = []
+    total_duration = 0
     for i in speech_generator:
         tts_speeches.append(i['tts_speech'])
+        total_duration += i['tts_speech'].shape[1] / cosyvoice.sample_rate
         if stream:
             yield (cosyvoice.sample_rate, i['tts_speech'].numpy().flatten()), None
             
     if not stream:
         audio_data = torch.concat(tts_speeches, dim=1)
         yield None, (cosyvoice.sample_rate, audio_data.numpy().flatten())
+    
+    yield total_duration
 
 def generate_audio(tts_text, mode_checkbox_group, sft_dropdown, prompt_text, prompt_wav_upload, prompt_wav_record, instruct_text,
                    seed, stream, speed):
@@ -262,18 +267,18 @@ def generate_audio(tts_text, mode_checkbox_group, sft_dropdown, prompt_text, pro
 
     # 根据不同模式处理
     if mode_checkbox_group == '预训练音色':
-        logging.info('get sft inference request')
+        # logging.info('get sft inference request')
         generator = cosyvoice.inference_sft(tts_text, sft_dropdown, stream=stream, speed=speed)
         
     elif mode_checkbox_group in ['3s极速复刻', '跨语种复刻']:
-        logging.info(f'get {mode_checkbox_group} inference request')
+        # logging.info(f'get {mode_checkbox_group} inference request')
         prompt_speech_16k = postprocess(load_wav(prompt_wav, prompt_sr))
         inference_func = (cosyvoice.inference_zero_shot if mode_checkbox_group == '3s极速复刻' 
                          else cosyvoice.inference_cross_lingual)
         generator = inference_func(tts_text, prompt_text, prompt_speech_16k, stream=stream, speed=speed)
         
     else:  # 自然语言控制模式
-        logging.info('get instruct inference request')
+        # logging.info('get instruct inference request')
         voice_path = f"{ROOT_DIR}/voices/{sft_dropdown}.pt"
         prompt_speech_16k = load_voice_data(voice_path)
         
@@ -285,10 +290,20 @@ def generate_audio(tts_text, mode_checkbox_group, sft_dropdown, prompt_text, pro
         generator = cosyvoice.inference_instruct2(tts_text, instruct_text, prompt_speech_16k, 
                                                 stream=stream, speed=speed)
 
-    # 处理音频生成
-    yield from process_audio(generator, stream)
+    # 处理音频生成并获取总时长
+    audio_generator = process_audio(generator, stream)
+    total_duration = 0
+    
+    # 收集所有音频输出
+    for output in audio_generator:
+        if isinstance(output, (float, int)):  # 如果是总时长
+            total_duration = output
+        else:  # 如果是音频数据
+            yield output
+
     processing_time = time.time() - start_time
-    logging.info(f"音频生成完成 耗时: {processing_time:.2f}秒")
+    rtf = processing_time / total_duration if total_duration > 0 else 0
+    logging.info(f"\n音频生成完成 耗时: {processing_time:.2f}秒, rtf: {rtf:.2f}")
 
 def update_audio_visibility(stream_enabled):
     """更新音频组件的可见性"""

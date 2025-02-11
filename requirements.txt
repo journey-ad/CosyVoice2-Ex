@@ -39,6 +39,8 @@ wget==3.2
 fastapi==0.115.6
 fastapi-cli==0.0.4
 WeTextProcessing==1.0.3
+pynini==2.1.5
+pyarrow==19.0.0
 flask
 flask_cors
 ffmpeg

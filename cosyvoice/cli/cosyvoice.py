@@ -15,6 +15,7 @@ import os
 import time
 from typing import Generator
 from tqdm import tqdm
+from math import ceil
 from hyperpyyaml import load_hyperpyyaml
 from modelscope import snapshot_download
 import torch
@@ -78,6 +79,46 @@ class CosyVoice:
         spks = list(self.frontend.spk2info.keys())
         return spks
 
+    def _process_with_progress(self, model_input, text_segment, stream, speed, start_time):
+        """处理带进度条的TTS生成
+        Args:
+            model_input: 模型输入
+            text_segment: 当前文本片段
+            stream: 是否流式输出
+            speed: 语速
+            start_time: 开始时间
+        """
+        # 初始化进度条参数
+        estimated_iterations = 1 if not stream else max(1, len(text_segment) // 10)
+        
+        with tqdm(total=estimated_iterations, leave=False, desc='当前片段', disable=not stream) as pbar:
+            iter_count = 0
+            
+            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
+                speech = model_output['tts_speech']
+                speech_len = speech.shape[1] / self.sample_rate
+                iter_count += 1
+
+                if stream:
+                    # 更新进度条
+                    rtf = (time.time() - start_time) / speech_len
+                    pbar.set_postfix_str(f'rtf={rtf:.2f}')
+                    
+                    # 仅在第一次迭代更新预估值
+                    if iter_count == 1:
+                        text_to_speech_ratio = speech_len / len(text_segment)
+                        new_estimate = max(1, ceil(len(text_segment) * text_to_speech_ratio * self.sample_rate / speech.shape[1]))
+                        pbar.total = max(estimated_iterations, new_estimate)
+                    
+                    # 动态调整总迭代次数
+                    pbar.total = max(pbar.total, iter_count)
+                    pbar.update(1)
+                else:
+                    pbar.close()
+
+                yield model_output
+                start_time = time.time()
+
     def inference_sft(self, tts_text, spk_id, stream=False, speed=1.0, text_frontend=True):
         default_voices = self.list_available_spks()
 
@@ -86,7 +127,7 @@ class CosyVoice:
         audio_samples = 0
         srtlines = []
         
-        for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
+        for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend), desc='生成进度'):
 
             # 根据音色ID获取模型输入
             spk = default_voices[0] if spk_id not in default_voices else spk_id
@@ -112,45 +153,33 @@ class CosyVoice:
                     model_input[field] = newspk[field]
 
             start_time = time.time()
-            logging.info(f'正在合成文本: {i}')
-            
-            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
+            tqdm.write(f'{i}\n')
+            for model_output in self._process_with_progress(model_input, i, stream, speed, start_time):
                 speech = model_output['tts_speech']
-                speech_len = speech.shape[1] / self.sample_rate
-                rtf = (time.time() - start_time) / speech_len
-                logging.info(f'生成语音长度: {speech_len:.2f}秒, RTF: {rtf:.2f}')
-
-                # 转换音频数据
                 audio = speech.numpy().ravel()
-                
-                # 计算时间戳
-                srtline_begin = ms_to_srt_time(audio_samples * 1000.0 / self.sample_rate)
+                srt_start = ms_to_srt_time(audio_samples * 1000.0 / self.sample_rate)
                 audio_samples += audio.size
-                srtline_end = ms_to_srt_time(audio_samples * 1000.0 / self.sample_rate)
+                srt_end = ms_to_srt_time(audio_samples * 1000.0 / self.sample_rate)
                 
-                # 保存音频和字幕数据
                 audio_opt.append(audio)
                 tts_speeches.append(speech)
-                
-                # 生成字幕
-                srt_index = len(audio_opt)
                 srtlines.extend([
-                    f"{srt_index:02d}\n",
-                    f"{srtline_begin} --> {srtline_end}\n",
+                    f"{len(audio_opt):02d}\n",
+                    f"{srt_start} --> {srt_end}\n",
                     f"{i.replace('、。', '')}\n\n"
                 ])
 
                 yield model_output
                 start_time = time.time()
-            
-            # 合并并保存音频
-            audio_data = torch.concat(tts_speeches, dim=1)
-            os.makedirs("音频输出", exist_ok=True)
-            torchaudio.save("音频输出/output.wav", audio_data, self.sample_rate)
-            
-            # 保存字幕文件
-            with open('音频输出/output.srt', 'w', encoding='utf-8') as f:
-                f.writelines(srtlines)
+
+        # 合并并保存音频
+        audio_data = torch.concat(tts_speeches, dim=1)
+        os.makedirs("音频输出", exist_ok=True)
+        torchaudio.save("音频输出/output.wav", audio_data, self.sample_rate)
+        
+        # 保存字幕文件
+        with open('音频输出/output.srt', 'w', encoding='utf-8') as f:
+            f.writelines(srtlines)
 
     def _save_voice_model(self, model_input, prompt_speech_16k, text_ref=None, save_path='output.pt'):
         """保存音色模型到文件
@@ -174,46 +203,33 @@ class CosyVoice:
         longest_segment = max(text_segments, key=len)
         longest_idx = text_segments.index(longest_segment)
         
-        for idx, i in enumerate(tqdm(text_segments)):
+        for idx, i in enumerate(tqdm(text_segments, desc='总进度')):
             if (not isinstance(i, Generator)) and len(i) < 0.5 * len(prompt_text):
                 logging.warning('synthesis text {} too short than prompt text {}, this may lead to bad performance'.format(i, prompt_text))
             model_input = self.frontend.frontend_zero_shot(i, prompt_text, prompt_speech_16k, self.sample_rate)
             start_time = time.time()
-            logging.info('synthesis text {}'.format(i))
+            tqdm.write(f'{i}\n')
 
             if idx == 0 or idx == longest_idx:  # 保存第一段或最长段作为音色模型
                 self._save_voice_model(model_input, prompt_speech_16k, prompt_text)
 
-            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
-                speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
-                logging.info('yield speech len {}, rtf {}, abs mean {}, std {}'.format(
-                    speech_len, 
-                    (time.time() - start_time) / speech_len, 
-                    model_output['tts_speech'].abs().mean(), 
-                    model_output['tts_speech'].std()
-                ))
-                yield model_output
-                start_time = time.time()
+            yield from self._process_with_progress(model_input, i, stream, speed, start_time)
 
-    def inference_cross_lingual(self, tts_text, prompt_speech_16k, stream=False, speed=1.0, text_frontend=True):
+    def inference_cross_lingual(self, tts_text, prompt_text, prompt_speech_16k, stream=False, speed=1.0, text_frontend=True):
         # 先获取所有分段，找出最长的一段
         text_segments = list(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend))
         longest_segment = max(text_segments, key=len)
         longest_idx = text_segments.index(longest_segment)
         
-        for idx, i in enumerate(tqdm(text_segments)):
+        for idx, i in enumerate(tqdm(text_segments, desc='总进度')):
             model_input = self.frontend.frontend_cross_lingual(i, prompt_speech_16k, self.sample_rate)
             start_time = time.time()
-            logging.info('synthesis text {}'.format(i))
+            tqdm.write(f'{i}\n')
             
             if idx == 0 or idx == longest_idx:  # 保存第一段或最长段作为音色模型
                 self._save_voice_model(model_input, prompt_speech_16k)
 
-            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
-                speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
-                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
-                yield model_output
-                start_time = time.time()
+            yield from self._process_with_progress(model_input, i, stream, speed, start_time)
 
     def inference_instruct(self, tts_text, spk_id, instruct_text, stream=False, speed=1.0, text_frontend=True):
         assert isinstance(self.model, CosyVoiceModel), 'inference_instruct is only implemented for CosyVoice!'
@@ -223,12 +239,8 @@ class CosyVoice:
         for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
             model_input = self.frontend.frontend_instruct(i, spk_id, instruct_text)
             start_time = time.time()
-            logging.info('synthesis text {}'.format(i))
-            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
-                speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
-                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
-                yield model_output
-                start_time = time.time()
+            tqdm.write(f'{i}\n')
+            yield from self._process_with_progress(model_input, i, stream, speed, start_time)
 
     def inference_vc(self, source_speech_16k, prompt_speech_16k, stream=False, speed=1.0):
         model_input = self.frontend.frontend_vc(source_speech_16k, prompt_speech_16k, self.sample_rate)
@@ -282,9 +294,5 @@ class CosyVoice2(CosyVoice):
         for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
             model_input = self.frontend.frontend_instruct2(i, instruct_text, prompt_speech_16k, self.sample_rate)
             start_time = time.time()
-            logging.info('synthesis text {}'.format(i))
-            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
-                speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
-                logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
-                yield model_output
-                start_time = time.time()
+            tqdm.write(f'{i}\n')
+            yield from self._process_with_progress(model_input, i, stream, speed, start_time)
