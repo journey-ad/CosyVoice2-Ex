@@ -303,7 +303,7 @@ def generate_audio(tts_text, mode_checkbox_group, sft_dropdown, prompt_text, pro
 
     processing_time = time.time() - start_time
     rtf = processing_time / total_duration if total_duration > 0 else 0
-    logging.info(f"\n音频生成完成 耗时: {processing_time:.2f}秒, rtf: {rtf:.2f}")
+    logging.info(f"音频生成完成 耗时: {processing_time:.2f}秒, rtf: {rtf:.2f}")
 
 def update_audio_visibility(stream_enabled):
     """更新音频组件的可见性"""

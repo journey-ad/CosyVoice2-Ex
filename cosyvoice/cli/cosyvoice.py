@@ -24,6 +24,9 @@ from cosyvoice.cli.frontend import CosyVoiceFrontEnd
 from cosyvoice.cli.model import CosyVoiceModel, CosyVoice2Model
 from cosyvoice.utils.file_utils import logging
 from cosyvoice.utils.class_utils import get_model_type
+import numpy as np
+import jieba
+import re
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -38,6 +41,113 @@ def ms_to_srt_time(ms):
     timesrt = f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
     # print(timesrt)
     return timesrt
+
+def split_subtitle_text(text, max_chars=15, min_chars=5):
+    """使用jieba分词智能分割字幕文本，优化分割逻辑
+    Args:
+        text: 要分割的文本
+        max_chars: 每行最大字符数
+        min_chars: 每行最小字符数
+    Returns:
+        分割后的文本列表
+    """
+    if not hasattr(split_subtitle_text, 'jieba_initialized'):
+        split_subtitle_text.jieba_initialized = True
+    
+    # 预处理：清理多余的标点和空格
+    text = re.sub(r'\s+', '', text)
+    text = re.sub(r'([。！？；，、])\1+', r'\1', text)
+    
+    if len(text) <= max_chars:
+        return [text]
+    
+    # 分词并保留标点符号
+    words = []
+    for word in jieba.cut(text, cut_all=False):
+        # 处理连续的标点符号
+        if re.match(r'^[。！？；，、]+$', word):
+            if words and re.match(r'^[。！？；，、]+$', words[-1]):
+                continue
+        words.append(word)
+    
+    result = []
+    current = ''
+    buffer = ''  # 用于临时存储未达到最小长度的内容
+    
+    for i, word in enumerate(words):
+        next_word = words[i + 1] if i + 1 < len(words) else ''
+        
+        if len(current + word) > max_chars:
+            if current:
+                result.append(current.strip())
+                current = word
+            else:
+                # 处理单个词超长的情况
+                parts = re.split('([。！？；，、])', word)
+                current = ''
+                for part in parts:
+                    if len(current + part) > max_chars:
+                        if current:
+                            result.append(current.strip())
+                            current = part
+                        else:
+                            result.append(part[:max_chars])
+                            current = part[max_chars:]
+                    else:
+                        current += part
+        else:
+            current += word
+            
+            # 智能断句逻辑
+            should_break = False
+            
+            # 主要断句标点
+            if re.search(r'[。！？；]$', word) and len(current) >= min_chars:
+                should_break = True
+            # 次要断句标点
+            elif re.search(r'[，、]$', word) and len(current) >= max_chars * 0.6:
+                # 检查下一个词的长度，避免留下过短的内容
+                if not next_word or len(next_word) + len(current) > max_chars:
+                    should_break = True
+            
+            if should_break:
+                if buffer:
+                    # 如果有缓存的短句，尝试合并
+                    if len(buffer + current) <= max_chars:
+                        result.append((buffer + current).strip())
+                        buffer = ''
+                    else:
+                        result.append(buffer.strip())
+                        result.append(current.strip())
+                else:
+                    result.append(current.strip())
+                current = ''
+    
+    # 处理剩余内容
+    if current:
+        if len(current) < min_chars and result:
+            # 尝试将过短的最后一句合并到前一句
+            if len(result[-1] + current) <= max_chars:
+                result[-1] = (result[-1] + current).strip()
+            else:
+                result.append(current.strip())
+        else:
+            result.append(current.strip())
+    
+    # 最终检查：合并过短的行
+    final_result = []
+    temp = ''
+    for line in result:
+        if len(temp + line) <= max_chars:
+            temp += line
+        else:
+            if temp:
+                final_result.append(temp.strip())
+            temp = line
+    if temp:
+        final_result.append(temp.strip())
+    
+    return final_result
 
 class CosyVoice:
 
@@ -79,15 +189,17 @@ class CosyVoice:
         spks = list(self.frontend.spk2info.keys())
         return spks
 
-    def _process_with_progress(self, model_input, text_segment, stream, speed, start_time):
+    def _process_with_progress(self, model_input, text_segment, stream, speed):
         """处理带进度条的TTS生成
         Args:
             model_input: 模型输入
             text_segment: 当前文本片段
             stream: 是否流式输出
             speed: 语速
-            start_time: 开始时间
         """
+        start_time = time.time()
+        tqdm.write(f'{text_segment}\n')
+        
         # 初始化进度条参数
         estimated_iterations = 1 if not stream else max(1, len(text_segment) // 10)
         
@@ -122,16 +234,14 @@ class CosyVoice:
     def inference_sft(self, tts_text, spk_id, stream=False, speed=1.0, text_frontend=True):
         default_voices = self.list_available_spks()
 
-        tts_speeches = []
-        audio_opt = []
         audio_samples = 0
-        srtlines = []
+        segment_info = []  # 用于存储每个片段的信息
         
-        for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend), desc='生成进度'):
+        for text_segment in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend), desc='生成进度'):
 
             # 根据音色ID获取模型输入
             spk = default_voices[0] if spk_id not in default_voices else spk_id
-            model_input = self.frontend.frontend_sft(i, spk)
+            model_input = self.frontend.frontend_sft(text_segment, spk)
 
             # 如果是自定义音色,加载并更新音色相关特征
             if spk_id not in default_voices:
@@ -152,25 +262,50 @@ class CosyVoice:
                 for field in spk_fields:
                     model_input[field] = newspk[field]
 
-            start_time = time.time()
-            tqdm.write(f'{i}\n')
-            for model_output in self._process_with_progress(model_input, i, stream, speed, start_time):
+            segment_audio = []
+            segment_speech = []
+            for model_output in self._process_with_progress(model_input, text_segment, stream, speed):
                 speech = model_output['tts_speech']
                 audio = speech.numpy().ravel()
-                srt_start = ms_to_srt_time(audio_samples * 1000.0 / self.sample_rate)
-                audio_samples += audio.size
-                srt_end = ms_to_srt_time(audio_samples * 1000.0 / self.sample_rate)
-                
-                audio_opt.append(audio)
-                tts_speeches.append(speech)
-                srtlines.extend([
-                    f"{len(audio_opt):02d}\n",
-                    f"{srt_start} --> {srt_end}\n",
-                    f"{i.replace('、。', '')}\n\n"
-                ])
 
+                audio_samples += audio.size
+                segment_audio.append(audio)
+                segment_speech.append(speech)
                 yield model_output
-                start_time = time.time()
+
+            # 每个片段结束时保存信息
+            segment_info.append({
+                'start_sample': audio_samples - sum(a.size for a in segment_audio),
+                'text': text_segment,
+                'audio': np.concatenate(segment_audio),  # 使用numpy的concatenate
+                'speech': torch.concat(segment_speech, dim=1)  # speech保持为tensor
+            })
+
+        # 流式生成结束后统一处理音频和字幕
+        srtlines = []
+        tts_speeches = []
+        subtitle_index = 1
+        
+        for segment in segment_info:
+            srt_start = ms_to_srt_time(segment['start_sample'] * 1000.0 / self.sample_rate)
+            total_duration = segment['audio'].size / self.sample_rate
+            
+            # 分割字幕文本
+            sub_texts = split_subtitle_text(segment['text'].replace('、。', ''), max_chars=15)
+            duration_per_sub = total_duration / len(sub_texts)
+            
+            for i, sub_text in enumerate(sub_texts):
+                sub_start_time = segment['start_sample'] / self.sample_rate + i * duration_per_sub
+                sub_end_time = sub_start_time + duration_per_sub
+                
+                srtlines.extend([
+                    f"{subtitle_index}\n",
+                    f"{ms_to_srt_time(sub_start_time * 1000)} --> {ms_to_srt_time(sub_end_time * 1000)}\n",
+                    f"{sub_text.strip(',.，。！；：')}\n\n"
+                ])
+                subtitle_index += 1
+            
+            tts_speeches.append(segment['speech'])
 
         # 合并并保存音频
         audio_data = torch.concat(tts_speeches, dim=1)
@@ -199,48 +334,42 @@ class CosyVoice:
         prompt_text = self.frontend.text_normalize(prompt_text, split=False, text_frontend=text_frontend)
         
         # 先获取所有分段，找出最长的一段
-        text_segments = list(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend))
-        longest_segment = max(text_segments, key=len)
-        longest_idx = text_segments.index(longest_segment)
+        text_parts = list(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend))
+        longest_segment = max(text_parts, key=len)
+        longest_idx = text_parts.index(longest_segment)
         
-        for idx, i in enumerate(tqdm(text_segments, desc='总进度')):
-            if (not isinstance(i, Generator)) and len(i) < 0.5 * len(prompt_text):
-                logging.warning('synthesis text {} too short than prompt text {}, this may lead to bad performance'.format(i, prompt_text))
-            model_input = self.frontend.frontend_zero_shot(i, prompt_text, prompt_speech_16k, self.sample_rate)
-            start_time = time.time()
-            tqdm.write(f'{i}\n')
+        for idx, text_segment in enumerate(tqdm(text_parts, desc='生成进度')):
+            if (not isinstance(text_segment, Generator)) and len(text_segment) < 0.5 * len(prompt_text):
+                logging.warning('synthesis text {} too short than prompt text {}, this may lead to bad performance'.format(text_segment, prompt_text))
+            model_input = self.frontend.frontend_zero_shot(text_segment, prompt_text, prompt_speech_16k, self.sample_rate)
 
             if idx == 0 or idx == longest_idx:  # 保存第一段或最长段作为音色模型
                 self._save_voice_model(model_input, prompt_speech_16k, prompt_text)
 
-            yield from self._process_with_progress(model_input, i, stream, speed, start_time)
+            yield from self._process_with_progress(model_input, text_segment, stream, speed)
 
     def inference_cross_lingual(self, tts_text, prompt_text, prompt_speech_16k, stream=False, speed=1.0, text_frontend=True):
         # 先获取所有分段，找出最长的一段
-        text_segments = list(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend))
-        longest_segment = max(text_segments, key=len)
-        longest_idx = text_segments.index(longest_segment)
+        text_parts = list(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend))
+        longest_segment = max(text_parts, key=len)
+        longest_idx = text_parts.index(longest_segment)
         
-        for idx, i in enumerate(tqdm(text_segments, desc='总进度')):
-            model_input = self.frontend.frontend_cross_lingual(i, prompt_speech_16k, self.sample_rate)
-            start_time = time.time()
-            tqdm.write(f'{i}\n')
+        for idx, text_segment in enumerate(tqdm(text_parts, desc='生成进度')):
+            model_input = self.frontend.frontend_cross_lingual(text_segment, prompt_speech_16k, self.sample_rate)
             
             if idx == 0 or idx == longest_idx:  # 保存第一段或最长段作为音色模型
                 self._save_voice_model(model_input, prompt_speech_16k)
 
-            yield from self._process_with_progress(model_input, i, stream, speed, start_time)
+            yield from self._process_with_progress(model_input, text_segment, stream, speed)
 
     def inference_instruct(self, tts_text, spk_id, instruct_text, stream=False, speed=1.0, text_frontend=True):
         assert isinstance(self.model, CosyVoiceModel), 'inference_instruct is only implemented for CosyVoice!'
         if self.instruct is False:
             raise ValueError('{} do not support instruct inference'.format(self.model_dir))
         instruct_text = self.frontend.text_normalize(instruct_text, split=False, text_frontend=text_frontend)
-        for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
-            model_input = self.frontend.frontend_instruct(i, spk_id, instruct_text)
-            start_time = time.time()
-            tqdm.write(f'{i}\n')
-            yield from self._process_with_progress(model_input, i, stream, speed, start_time)
+        for text_segment in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
+            model_input = self.frontend.frontend_instruct(text_segment, spk_id, instruct_text)
+            yield from self._process_with_progress(model_input, text_segment, stream, speed)
 
     def inference_vc(self, source_speech_16k, prompt_speech_16k, stream=False, speed=1.0):
         model_input = self.frontend.frontend_vc(source_speech_16k, prompt_speech_16k, self.sample_rate)
@@ -291,8 +420,6 @@ class CosyVoice2(CosyVoice):
 
     def inference_instruct2(self, tts_text, instruct_text, prompt_speech_16k, stream=False, speed=1.0, text_frontend=True):
         assert isinstance(self.model, CosyVoice2Model), 'inference_instruct2 is only implemented for CosyVoice2!'
-        for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
-            model_input = self.frontend.frontend_instruct2(i, instruct_text, prompt_speech_16k, self.sample_rate)
-            start_time = time.time()
-            tqdm.write(f'{i}\n')
-            yield from self._process_with_progress(model_input, i, stream, speed, start_time)
+        for text_segment in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
+            model_input = self.frontend.frontend_instruct2(text_segment, instruct_text, prompt_speech_16k, self.sample_rate)
+            yield from self._process_with_progress(model_input, text_segment, stream, speed)
