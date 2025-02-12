@@ -24,130 +24,11 @@ from cosyvoice.cli.frontend import CosyVoiceFrontEnd
 from cosyvoice.cli.model import CosyVoiceModel, CosyVoice2Model
 from cosyvoice.utils.file_utils import logging
 from cosyvoice.utils.class_utils import get_model_type
-import numpy as np
-import jieba
-import re
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.abspath(os.path.join(current_dir, os.pardir))
 grandparent_dir = os.path.dirname(parent_dir)
-
-def ms_to_srt_time(ms):
-    N = int(ms)
-    hours, remainder = divmod(N, 3600000)
-    minutes, remainder = divmod(remainder, 60000)
-    seconds, milliseconds = divmod(remainder, 1000)
-    timesrt = f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
-    # print(timesrt)
-    return timesrt
-
-def split_subtitle_text(text, max_chars=15, min_chars=5):
-    """使用jieba分词智能分割字幕文本，优化分割逻辑
-    Args:
-        text: 要分割的文本
-        max_chars: 每行最大字符数
-        min_chars: 每行最小字符数
-    Returns:
-        分割后的文本列表
-    """
-    if not hasattr(split_subtitle_text, 'jieba_initialized'):
-        split_subtitle_text.jieba_initialized = True
-    
-    # 预处理：清理多余的标点和空格
-    text = re.sub(r'\s+', '', text)
-    text = re.sub(r'([。！？；，、])\1+', r'\1', text)
-    
-    if len(text) <= max_chars:
-        return [text]
-    
-    # 分词并保留标点符号
-    words = []
-    for word in jieba.cut(text, cut_all=False):
-        # 处理连续的标点符号
-        if re.match(r'^[。！？；，、]+$', word):
-            if words and re.match(r'^[。！？；，、]+$', words[-1]):
-                continue
-        words.append(word)
-    
-    result = []
-    current = ''
-    buffer = ''  # 用于临时存储未达到最小长度的内容
-    
-    for i, word in enumerate(words):
-        next_word = words[i + 1] if i + 1 < len(words) else ''
-        
-        if len(current + word) > max_chars:
-            if current:
-                result.append(current.strip())
-                current = word
-            else:
-                # 处理单个词超长的情况
-                parts = re.split('([。！？；，、])', word)
-                current = ''
-                for part in parts:
-                    if len(current + part) > max_chars:
-                        if current:
-                            result.append(current.strip())
-                            current = part
-                        else:
-                            result.append(part[:max_chars])
-                            current = part[max_chars:]
-                    else:
-                        current += part
-        else:
-            current += word
-            
-            # 智能断句逻辑
-            should_break = False
-            
-            # 主要断句标点
-            if re.search(r'[。！？；]$', word) and len(current) >= min_chars:
-                should_break = True
-            # 次要断句标点
-            elif re.search(r'[，、]$', word) and len(current) >= max_chars * 0.6:
-                # 检查下一个词的长度，避免留下过短的内容
-                if not next_word or len(next_word) + len(current) > max_chars:
-                    should_break = True
-            
-            if should_break:
-                if buffer:
-                    # 如果有缓存的短句，尝试合并
-                    if len(buffer + current) <= max_chars:
-                        result.append((buffer + current).strip())
-                        buffer = ''
-                    else:
-                        result.append(buffer.strip())
-                        result.append(current.strip())
-                else:
-                    result.append(current.strip())
-                current = ''
-    
-    # 处理剩余内容
-    if current:
-        if len(current) < min_chars and result:
-            # 尝试将过短的最后一句合并到前一句
-            if len(result[-1] + current) <= max_chars:
-                result[-1] = (result[-1] + current).strip()
-            else:
-                result.append(current.strip())
-        else:
-            result.append(current.strip())
-    
-    # 最终检查：合并过短的行
-    final_result = []
-    temp = ''
-    for line in result:
-        if len(temp + line) <= max_chars:
-            temp += line
-        else:
-            if temp:
-                final_result.append(temp.strip())
-            temp = line
-    if temp:
-        final_result.append(temp.strip())
-    
-    return final_result
 
 class CosyVoice:
 
@@ -233,9 +114,6 @@ class CosyVoice:
 
     def inference_sft(self, tts_text, spk_id, stream=False, speed=1.0, text_frontend=True):
         default_voices = self.list_available_spks()
-
-        audio_samples = 0
-        segment_info = []  # 用于存储每个片段的信息
         
         for text_segment in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend), desc='生成进度'):
 
@@ -262,59 +140,7 @@ class CosyVoice:
                 for field in spk_fields:
                     model_input[field] = newspk[field]
 
-            segment_audio = []
-            segment_speech = []
-            for model_output in self._process_with_progress(model_input, text_segment, stream, speed):
-                speech = model_output['tts_speech']
-                audio = speech.numpy().ravel()
-
-                audio_samples += audio.size
-                segment_audio.append(audio)
-                segment_speech.append(speech)
-                yield model_output
-
-            # 每个片段结束时保存信息
-            segment_info.append({
-                'start_sample': audio_samples - sum(a.size for a in segment_audio),
-                'text': text_segment,
-                'audio': np.concatenate(segment_audio),  # 使用numpy的concatenate
-                'speech': torch.concat(segment_speech, dim=1)  # speech保持为tensor
-            })
-
-        # 流式生成结束后统一处理音频和字幕
-        srtlines = []
-        tts_speeches = []
-        subtitle_index = 1
-        
-        for segment in segment_info:
-            srt_start = ms_to_srt_time(segment['start_sample'] * 1000.0 / self.sample_rate)
-            total_duration = segment['audio'].size / self.sample_rate
-            
-            # 分割字幕文本
-            sub_texts = split_subtitle_text(segment['text'].replace('、。', ''), max_chars=15)
-            duration_per_sub = total_duration / len(sub_texts)
-            
-            for i, sub_text in enumerate(sub_texts):
-                sub_start_time = segment['start_sample'] / self.sample_rate + i * duration_per_sub
-                sub_end_time = sub_start_time + duration_per_sub
-                
-                srtlines.extend([
-                    f"{subtitle_index}\n",
-                    f"{ms_to_srt_time(sub_start_time * 1000)} --> {ms_to_srt_time(sub_end_time * 1000)}\n",
-                    f"{sub_text.strip(',.，。！；：')}\n\n"
-                ])
-                subtitle_index += 1
-            
-            tts_speeches.append(segment['speech'])
-
-        # 合并并保存音频
-        audio_data = torch.concat(tts_speeches, dim=1)
-        os.makedirs("音频输出", exist_ok=True)
-        torchaudio.save("音频输出/output.wav", audio_data, self.sample_rate)
-        
-        # 保存字幕文件
-        with open('音频输出/output.srt', 'w', encoding='utf-8') as f:
-            f.writelines(srtlines)
+            yield from self._process_with_progress(model_input, text_segment, stream, speed)
 
     def _save_voice_model(self, model_input, prompt_speech_16k, text_ref=None, save_path='output.pt'):
         """保存音色模型到文件
